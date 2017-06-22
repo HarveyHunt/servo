@@ -78,6 +78,7 @@ use style::selector_parser::{PseudoElement, SelectorImpl, extended_filtering};
 use style::shared_lock::{SharedRwLock as StyleSharedRwLock, Locked as StyleLocked};
 use style::str::is_whitespace;
 use style::stylearc::Arc;
+use style_traits::ToCss;
 
 #[derive(Copy, Clone)]
 pub struct ServoLayoutNode<'a> {
@@ -412,7 +413,7 @@ impl<'le> TElement for ServoLayoutElement<'le> {
 
     #[inline]
     fn has_attr(&self, namespace: &Namespace, attr: &LocalName) -> bool {
-        self.get_attr(namespace, attr).is_some()
+        self.get_attr_enum(namespace, attr).is_some()
     }
 
     #[inline]
@@ -520,9 +521,9 @@ impl<'le> TElement for ServoLayoutElement<'le> {
 
     #[inline]
     fn lang_attr(&self) -> Option<SelectorAttrValue> {
-        self.get_attr(&ns!(xml), &local_name!("lang"))
-            .or_else(|| self.get_attr(&ns!(), &local_name!("lang")))
-            .map(|v| String::from(v as &str))
+        self.get_attr_enum(&ns!(xml), &local_name!("lang"))
+            .or_else(|| self.get_attr_enum(&ns!(), &local_name!("lang")))
+            .map(|v| v.as_atom().to_string())
     }
 
     fn match_element_lang(&self,
@@ -544,8 +545,8 @@ impl<'le> TElement for ServoLayoutElement<'le> {
         // do this, we should make `get_lang_for_layout` return an Option,
         // so we can decide when to fall back to the Content-Language check.
         let element_lang = match override_lang {
-            Some(Some(lang)) => lang,
-            Some(None) => String::new(),
+            Some(Some(lang)) => Atom::from(lang),
+            Some(None) => atom!(""),
             None => self.element.get_lang_for_layout(),
         };
         extended_filtering(&element_lang, &*value)
@@ -582,12 +583,6 @@ impl<'le> ServoLayoutElement<'le> {
     }
 
     #[inline]
-    fn get_attr(&self, namespace: &Namespace, name: &LocalName) -> Option<&str> {
-        unsafe {
-            (*self.element.unsafe_get()).get_attr_val_for_layout(namespace, name)
-        }
-    }
-
     fn get_style_data(&self) -> Option<&StyleData> {
         unsafe {
             self.get_style_and_layout_data().map(|d| &*d.ptr.get())
@@ -674,16 +669,24 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
                     local_name: &LocalName,
                     operation: &AttrSelectorOperation<&String>)
                     -> bool {
+        let mut serialize = |block: &StyleLocked<PropertyDeclarationBlock>| {
+            let node = self.element.upcast::<Node>();
+            let doc = unsafe { node.owner_doc_for_layout() };
+            let lock = unsafe { doc.style_shared_lock() };
+            // This is porbably slow, but it only happens for silly selectors like [style*=color]
+            let guard = lock.read();
+            block.read_with(&guard).to_css_string()
+        };
         match *ns {
             NamespaceConstraint::Specific(ref ns) => {
                 self.get_attr_enum(ns, local_name)
-                    .map_or(false, |value| value.eval_selector(operation))
+                    .map_or(false, |value| value.eval_selector(operation, &mut serialize))
             }
             NamespaceConstraint::Any => {
                 let values = unsafe {
                     (*self.element.unsafe_get()).get_attr_vals_for_layout(local_name)
                 };
-                values.iter().any(|value| value.eval_selector(operation))
+                values.iter().any(|value| value.eval_selector(operation, &mut serialize))
             }
         }
     }
@@ -752,7 +755,7 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
             },
             NonTSPseudoClass::ServoCaseSensitiveTypeAttr(ref expected_value) => {
                 self.get_attr_enum(&ns!(), &local_name!("type"))
-                    .map_or(false, |attr| attr == expected_value)
+                    .map_or(false, |attr| &*attr.as_atom() == expected_value)
             }
             NonTSPseudoClass::ReadOnly =>
                 !self.element.get_state_for_layout().contains(pseudo_class.state_flag()),
@@ -774,15 +777,13 @@ impl<'le> ::selectors::Element for ServoLayoutElement<'le> {
 
     #[inline]
     fn is_link(&self) -> bool {
-        unsafe {
-            match self.as_node().script_type_id() {
-                // https://html.spec.whatwg.org/multipage/#selector-link
-                NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLAnchorElement)) |
-                NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLAreaElement)) |
-                NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLLinkElement)) =>
-                    (*self.element.unsafe_get()).get_attr_val_for_layout(&ns!(), &local_name!("href")).is_some(),
-                _ => false,
-            }
+        match self.as_node().script_type_id() {
+            // https://html.spec.whatwg.org/multipage/#selector-link
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLAnchorElement)) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLAreaElement)) |
+            NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLLinkElement)) =>
+                self.get_attr_enum(&ns!(), &local_name!("href")).is_some(),
+            _ => false,
         }
     }
 
@@ -1145,10 +1146,6 @@ impl<'le> ThreadSafeLayoutElement for ServoThreadSafeLayoutElement<'le> {
         self.element.get_attr_enum(namespace, name)
     }
 
-    fn get_attr<'a>(&'a self, namespace: &Namespace, name: &LocalName) -> Option<&'a str> {
-        self.element.get_attr(namespace, name)
-    }
-
     fn style_data(&self) -> AtomicRef<ElementData> {
         self.element.get_data()
             .expect("Unstyled layout node?")
@@ -1227,18 +1224,7 @@ impl<'le> ::selectors::Element for ServoThreadSafeLayoutElement<'le> {
                     local_name: &LocalName,
                     operation: &AttrSelectorOperation<&String>)
                     -> bool {
-        match *ns {
-            NamespaceConstraint::Specific(ref ns) => {
-                self.get_attr_enum(ns, local_name)
-                    .map_or(false, |value| value.eval_selector(operation))
-            }
-            NamespaceConstraint::Any => {
-                let values = unsafe {
-                    (*self.element.element.unsafe_get()).get_attr_vals_for_layout(local_name)
-                };
-                values.iter().any(|v| v.eval_selector(operation))
-            }
-        }
+        self.element.attr_matches(ns, local_name, operation)
     }
 
     fn match_non_ts_pseudo_class<F>(&self,
